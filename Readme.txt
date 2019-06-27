@@ -37,5 +37,9 @@ Although I used the same init value to train the model, the parameters are not 1
 
 6. 
 However, pictures based on 5 is not shaped like y=x. 
-I doubt the pre-processing function may not correct ???
+I doubt the 'pre-processing' function may not correct 
+
 ---- todo ----
+1. modify pre-processing function;
+2. modify plotting function: size(color) of dot should differ based on the number of smae points.
+
