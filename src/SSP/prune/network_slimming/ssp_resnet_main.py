@@ -27,37 +27,35 @@ from torch.utils.tensorboard import SummaryWriter
 from filelock import FileLock
 
 
-def generate_train_loader(batch_size,**kwargs):
-    with FileLock(os.path.expanduser("./data.cifar10")):
-        train_loader = torch.utils.data.DataLoader(
+def generate_train_loader(batch_size,kwargs):
+    train_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10('./data.cifar10', train=True, download=True,
-            transform=transforms.Compose([
-                transforms.Pad(4),
-                transforms.RandomCrop(32),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-            ])),
-        batch_size=batch_size, shuffle=True, **kwargs)
-    return train_loader
-
-def generate_test_loader(test_batch_size):
-    with FileLock(os.path.expanduser("./data.cifar10")):
-        test_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10('./data.cifar10', train=False, transform=transforms.Compose([
+        transform=transforms.Compose([
+            transforms.Pad(4),
+            transforms.RandomCrop(32),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
         ])),
-    batch_size=test_batch_size, shuffle=True)
+    batch_size=batch_size, shuffle=True, **kwargs)
+    return train_loader
+
+def generate_test_loader(test_batch_size):
+    test_loader = torch.utils.data.DataLoader(
+        datasets.CIFAR10('./data.cifar10', train=False, transform=transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])),batch_size=test_batch_size, shuffle=True)
     return test_loader
 
 @ray.remote
 class ParameterServer():
-    def __init__(self,num_workers,stalness_limit,test_loader,resume_from_ckpt):
+    def __init__(self,args,test_loader):
         self.model = models.__dict__["resnet"](dataset="cifar10",depth=args.depth)
-        self.stalness_table = [0] * num_workers
-        self.stalness_limit = stalness_limit 
+        self.stalness_table = [0] * args.num_workers
+        self.stalness_limit = args.stalness_limit 
         self.global_step = 0
+        self.lr = args.lr
         self.eva_model = models.__dict__["resnet"](dataset="cifar10",depth=args.depth)
         self.optimizer = optim.SGD(self.model.parameters(),
                           lr=args.lr,
@@ -67,6 +65,7 @@ class ParameterServer():
         self.model.cpu()
         self.eva_model.cpu()
         self.ps_writer = SummaryWriter(args.tb_path+'/ps')
+        self.save_path = args.save
         if args.resume:
             if os.path.isfile(args.resume):
                 print("=> loading checkpoint '{}'".format(args.resume))
@@ -89,7 +88,11 @@ class ParameterServer():
         if self.global_step % 100 == 0:
             print("global_step: ",self.global_step," and prepare evaluate")
             self.evaluate()
-            self.save_ckpt()
+            self.save_ckpt({
+                'global_step':global_step,
+                'state_dict':self.model.state_dict(),
+                'optimizer':self.optimizer.state_dict()
+            },filepath=self.save_path)
             
         
     def pull_weights(self):
@@ -105,11 +108,9 @@ class ParameterServer():
     def get_stalness(self):
         return min(self.stalness_table)
     
-    def save_ckpt(self,state,is_best,filepath):
+    def save_ckpt(self,state,filepath):
         torch.save(state,os.path.join(filepath,'checkpoint.pth.tar'))
-        if is_best:
-            shutil.copyfile(os.path.join(filepath,'checkpoint.pth.tar'),os.path.join(filepath,'model_best.pth.tar'))
-    
+        
     def evaluate(self):
         print("going to evaluate")
         test_loss = 0.
@@ -142,29 +143,32 @@ class ParameterServer():
             100. * correct / len(data)))
 
 @ray.remote(num_gpus=1)
-def worker_task(ps,worker_index,stale_limit, train_loader,lr,momentum,weight_decay,batch_size,start_epoch,epochs,depth,resume,cuda,tb_path):
+def worker_task(args,ps,worker_index, train_loader):
     # Initialize the model.
-    model = models.__dict__["resnet"](dataset="cifar10",depth=depth)
+    if args.debug: print(worker_index, " worker is going to sleep ",worker_index*5000)
+    time.sleep(worker_index * 5000)
+    
+    model = models.__dict__["resnet"](dataset="cifar10",depth=args.depth)
     local_step = 0
     optimizer = optim.SGD(model.parameters(),
-                          lr=lr,
-                          momentum=momentum,
-                          weight_decay=weight_decay)
-    if cuda:
+                          lr=args.lr,
+                          momentum=args.momentum,
+                          weight_decay=args.weight_decay)
+    if args.cuda:
         starttime = datetime.datetime.now()
         model.cuda()
         endtime = datetime.datetime.now()
         time_cost = (endtime - starttime).seconds
-#         print("move model to gpu takes: ", time_cost, "seconds")
-    if resume:
-        checkpoint = torch.load(resume)
+        if args.debug: print("move model to gpu takes: ", time_cost, "seconds")
+    if args.resume:
+        checkpoint = torch.load(args.resume)
         local_step = checkpoint['step'] / 2
         optimizer.load_state_dict(checkpoint['optimizer'])
 
 
-    wk_writer = SummaryWriter(os.path.join(tb_path,'wk_',str(worker_index)))
+    wk_writer = SummaryWriter(os.path.join(args.tb_path,'wk_',str(worker_index)))
     
-    for epoch in range(start_epoch,epochs):
+    for epoch in range(args.start_epoch,args.epochs):
         avg_loss = 0.
         train_acc = 0.
         for batch_idx,(data,target) in enumerate(train_loader):
@@ -172,44 +176,44 @@ def worker_task(ps,worker_index,stale_limit, train_loader,lr,momentum,weight_dec
                 starttime = datetime.datetime.now()
                 data,target = data.cuda(),target.cuda()
                 mid = datetime.datetime.now()
-    #             print("move data to gpu takes: ", (mid - starttime).seconds, "seconds")
+                if args.debug: print("move data to gpu takes: ", (mid - starttime).seconds, "seconds")
                 model.cuda()
                 endtime = datetime.datetime.now()
                 time_cost = (endtime - starttime).seconds
-    #             print("move model to gpu takes: ", time_cost, "seconds")
+                if args.debug: print("move model to gpu takes: ", time_cost, "seconds")
                 
-            while(local_step - ray.get(ps.get_stalness.remote()) > stale_limit):
+            while(local_step - ray.get(ps.get_stalness.remote()) > args.stalness_limit):
                 print(worker_index," works too fast")
                 sleep(1)
             # Get the current weights from the parameter server.
-    #         print("the ",worker_index," pulls wei from ps.")
+            if args.debug: print("the ",worker_index," pulls wei from ps.")
             init_wei = ray.get(ps.pull_weights.remote())
             model.load_state_dict(init_wei)
-    #         print("the ",worker_index," loaded the latest wei from ps.")
+            if args.debug: print("the ",worker_index," loaded the latest wei from ps.")
             # Compute an update and push it to the parameter server.        
             data, target = Variable(data), Variable(target)
             optimizer.zero_grad()
-    #         print(worker_index,' is generating output')
+            if args.debug: print(worker_index,' is generating output')
             output = model(data)
-    #         print(worker_index,' generated output done and going to calculate loss')
+            if args.debug: print(worker_index,' generated output done and going to calculate loss')
             loss = F.cross_entropy(output,target)
             avg_loss += loss
             pred = output.data.max(1,keepdim=True)[1]
             batch_acc = pred.eq(target.data.view_as(pred)).cpu().sum()
             train_acc += batch_acc
-    #         print(worker_index,' calculated loss and going to bp')
+            if args.debug: print(worker_index,' calculated loss and going to bp')
             loss.backward()
-    #         print(worker_index,' bp done')
+            if args.debug: print(worker_index,' bp done')
             # starttime = datetime.datetime.now()
             model.cpu()
             # endtime = datetime.datetime.now()
             # time_cost = (endtime - starttime).seconds
             # print("move model to cpu takes: ", time_cost, "seconds")
             grad = [p.grad for p in model.parameters()]
-    #         print(worker_index,' got the grad list')
+            if args.debug: print(worker_index,' got the grad list')
             local_step += 1
             ps.apply_gradients.remote(grad,worker_index)
-    #         print(worker_index,' sended the grad to ps and going to move next step')
+            if args.debug: print(worker_index,' sended the grad to ps and going to move next step')
             optimizer.step()
             if batch_idx % args.log_interval == 0:
                 print('The {} worker, Train Epoch: {} [{}/{} ({:.1f}%)]\tLoss: {:.6f}'.format(
@@ -241,11 +245,12 @@ if __name__ == "__main__":
     parser.add_argument('--resume', default=None, type=str)
     parser.add_argument('--no-cuda', action='store_true', default=False)
     parser.add_argument('--save', default='./logs', type=str)
-    parser.add_argument('--depth', default=19, type=int)
-    parser.add_argument('--tb-path', default='', type=str)
+    parser.add_argument('--depth', default=164, type=int)
+    parser.add_argument('--tb-path', default='./logs', type=str)
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--num-workers',type=int,default=1)
     parser.add_argument('--stalness-limit',type=int,default=5)
+    parser.add_argument('--debug',action='store_true',default=False)
 
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -260,8 +265,8 @@ if __name__ == "__main__":
 
     resume_from_ckpt = args.resume if (args.resume and os.path.isfile(args.resume)) else None
 
-    ps = ParameterServer.remote(lr,args.num_workers,args.stalness_limit,test_loader,resume_from_ckpt)
-
-    worker_tasks = [worker_task.remote(ps,idx,args.stalness_limit,train_loaders[idx],args.lr,args.momentum,args.weight_decay,args.depth,resume_from_ckpt,args.cuda,args.tb_path) for idx in range(args.num_workers)]
+    ps = ParameterServer.remote(args,test_loader)
+    
+    worker_tasks = [worker_task.remote(args,ps,idx,train_loaders[idx]) for idx in range(args.num_workers)]
     
     
